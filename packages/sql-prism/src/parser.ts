@@ -1,0 +1,509 @@
+// packages/sql-prism/src/parser.ts
+
+import {
+  DbtRelationToken,
+  maskCommentsAndStrings,
+  sanitizeJinjaSql,
+  tryClassifyDataTypeIndex,
+} from '@prism/core';
+
+export type InnerTablesMode = 'cteColor' | 'independent';
+export type KeywordColorMode = 'off' | 'cteScope' | 'targetContext' | 'hybrid';
+
+export interface HighlightMatch {
+  startOffset: number;
+  endOffset: number;
+  colorIndex: number;
+}
+
+export interface TypeHighlightMatch {
+  startOffset: number;
+  endOffset: number;
+  categoryIndex: number;
+}
+
+export interface CteBlock {
+  name: string;
+  colorIndex: number;
+  nameStartOffset: number;
+  closeParenOffset: number;
+}
+
+export interface ParseResult {
+  matches: HighlightMatch[];
+  cteBlocks: CteBlock[];
+  typeMatches: TypeHighlightMatch[];
+}
+
+const SQL_RESERVED_KEYWORDS = new Set([
+  'select', 'from', 'where', 'join', 'inner', 'left', 'right', 'full',
+  'outer', 'cross', 'natural', 'on', 'using', 'group', 'order', 'by',
+  'having', 'limit', 'offset', 'fetch', 'union', 'all', 'intersect',
+  'except', 'minus', 'with', 'recursive', 'as', 'distinct', 'into',
+  'values', 'set', 'update', 'delete', 'insert', 'create', 'table',
+  'view', 'temp', 'temporary', 'when', 'then', 'else', 'end', 'case',
+  'and', 'or', 'not', 'in', 'is', 'null', 'like', 'ilike', 'between',
+  'exists', 'cast', 'try_cast', 'safe_cast', 'over', 'partition',
+  'qualify', 'window', 'lateral', 'unnest', 'pivot', 'unpivot',
+  'sample', 'tablesample', 'for', 'asc', 'desc', 'nulls', 'first',
+  'last', 'true', 'false',
+]);
+
+const MULTI_WORD_TYPE_PATTERN =
+  'character\\s+varying|double\\s+precision|timestamp\\s+with(?:out)?\\s+time\\s+zone|time\\s+with(?:out)?\\s+time\\s+zone|bit\\s+varying|[a-zA-Z_][a-zA-Z0-9_]*';
+
+const TYPE_SPEC_REGEX = new RegExp(
+  `^(${MULTI_WORD_TYPE_PATTERN})(\\s*\\(\\s*[^()]*\\s*\\))?(\\s*\\[\\s*\\])*`,
+  'i'
+);
+
+export function sanitizeSql(rawSql: string): {
+  sanitized: string;
+  relations: Map<string, DbtRelationToken>;
+} {
+  const { sanitizedSql, relations } = sanitizeJinjaSql(rawSql);
+  const sanitized = maskCommentsAndStrings(sanitizedSql);
+  return { sanitized, relations };
+}
+
+function findMatchingCloseParen(sanitized: string, openParenOffset: number): number {
+  let depth = 0;
+  for (let i = openParenOffset; i < sanitized.length; i++) {
+    const ch = sanitized[i];
+    if (ch === '(') {
+      depth++;
+    } else if (ch === ')') {
+      depth--;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+function findTopLevelAsAfterOffset(body: string): number {
+  let depth = 0;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === '(') {
+      depth++;
+    } else if (ch === ')') {
+      if (depth > 0) {
+        depth--;
+      }
+    } else if (depth === 0) {
+      const remaining = body.slice(i);
+      const asMatch = remaining.match(/^\bAS\s+/i);
+      if (asMatch && (i === 0 || !/[a-zA-Z0-9_]/.test(body[i - 1]!))) {
+        return i + asMatch[0].length;
+      }
+    }
+  }
+  return -1;
+}
+
+function parseDataTypes(sanitized: string): TypeHighlightMatch[] {
+  const typeMatches: TypeHighlightMatch[] = [];
+  const recordedTypeSpans = new Set<string>();
+
+  const addTypeMatch = (startOffset: number, endOffset: number, categoryIndex: number) => {
+    const key = `${startOffset}:${endOffset}`;
+    if (!recordedTypeSpans.has(key)) {
+      recordedTypeSpans.add(key);
+      typeMatches.push({ startOffset, endOffset, categoryIndex });
+    }
+  };
+
+  const tryMatchTypeAt = (textSlice: string, baseOffset: number) => {
+    const specMatch = textSlice.match(TYPE_SPEC_REGEX);
+    if (!specMatch || !specMatch[1]) {
+      return;
+    }
+
+    const fullMatchedText = specMatch[0];
+    const normalizedTypeName = specMatch[1].replace(/\s+/g, ' ');
+    const isArraySpec = Boolean(specMatch[3]);
+    const categoryIndex = tryClassifyDataTypeIndex(
+      isArraySpec ? `${normalizedTypeName}[]` : normalizedTypeName
+    );
+
+    if (categoryIndex !== undefined) {
+      addTypeMatch(baseOffset, baseOffset + fullMatchedText.length, categoryIndex);
+    }
+  };
+
+  const doubleColonRegex = /::\s*/g;
+  let dcMatch: RegExpExecArray | null;
+
+  while ((dcMatch = doubleColonRegex.exec(sanitized)) !== null) {
+    const typeStartOffset = dcMatch.index + dcMatch[0].length;
+    const remaining = sanitized.slice(typeStartOffset);
+    tryMatchTypeAt(remaining, typeStartOffset);
+  }
+
+  const castFuncRegex = /\b(?:CAST|TRY_CAST|SAFE_CAST)\s*\(/gi;
+  let cfMatch: RegExpExecArray | null;
+
+  while ((cfMatch = castFuncRegex.exec(sanitized)) !== null) {
+    const openParenOffset = cfMatch.index + cfMatch[0].length - 1;
+    const closeParenOffset = findMatchingCloseParen(sanitized, openParenOffset);
+    if (closeParenOffset === -1) {
+      continue;
+    }
+
+    const innerBody = sanitized.slice(openParenOffset + 1, closeParenOffset);
+    const typeRelOffset = findTopLevelAsAfterOffset(innerBody);
+    if (typeRelOffset !== -1) {
+      const typeAbsOffset = openParenOffset + 1 + typeRelOffset;
+      const typeSlice = innerBody.slice(typeRelOffset);
+      tryMatchTypeAt(typeSlice, typeAbsOffset);
+    }
+  }
+
+  return typeMatches;
+}
+
+export function parseSqlDocument(
+  rawSql: string,
+  paletteSize: number,
+  innerTablesMode: InnerTablesMode = 'cteColor',
+  keywordMode: KeywordColorMode = 'off'
+): ParseResult {
+  const { sanitized, relations } = sanitizeSql(rawSql);
+  const matches: HighlightMatch[] = [];
+  const cteBlocks: CteBlock[] = [];
+  const recordedSpans = new Set<string>();
+
+  const cteColorMap = new Map<string, number>();
+  const globalTableColorMap = new Map<string, number>();
+  let nextColorCounter = 0;
+
+  const getOrAssignCteColor = (cteName: string): number => {
+    const key = cteName.toLowerCase();
+    let colorIdx = cteColorMap.get(key);
+    if (colorIdx === undefined) {
+      colorIdx = nextColorCounter % paletteSize;
+      cteColorMap.set(key, colorIdx);
+      nextColorCounter++;
+    }
+    return colorIdx;
+  };
+
+  const getOrAssignIndependentColor = (entityName: string): number => {
+    const key = entityName.toLowerCase();
+    let colorIdx = globalTableColorMap.get(key);
+    if (colorIdx === undefined) {
+      colorIdx = nextColorCounter % paletteSize;
+      globalTableColorMap.set(key, colorIdx);
+      nextColorCounter++;
+    }
+    return colorIdx;
+  };
+
+  const addMatch = (startOffset: number, endOffset: number, colorIndex: number) => {
+    const spanKey = `${startOffset}:${endOffset}`;
+    if (!recordedSpans.has(spanKey)) {
+      recordedSpans.add(spanKey);
+      matches.push({ startOffset, endOffset, colorIndex });
+    }
+  };
+
+  interface InternalCteSpan {
+    name: string;
+    colorIndex: number;
+    headerStartOffset: number;
+    nameStartOffset: number;
+    nameEndOffset: number;
+    openParenOffset: number;
+    closeParenOffset: number;
+  }
+
+  const cteSpans: InternalCteSpan[] = [];
+  const recordedCteOpenParens = new Set<number>();
+  const withStartRegex = /\bWITH(?:\s+RECURSIVE)?\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(/gi;
+  let withMatch: RegExpExecArray | null;
+
+  while ((withMatch = withStartRegex.exec(sanitized)) !== null) {
+    const firstCteName = withMatch[1]!;
+    if (SQL_RESERVED_KEYWORDS.has(firstCteName.toLowerCase())) {
+      continue;
+    }
+
+    const nameRelIdx = withMatch[0].search(new RegExp(`\\b${firstCteName}\\b`));
+    const nameStartOffset = withMatch.index + nameRelIdx;
+    const nameEndOffset = nameStartOffset + firstCteName.length;
+    const openParenOffset = withMatch.index + withMatch[0].length - 1;
+    const closeParenOffset = findMatchingCloseParen(sanitized, openParenOffset);
+
+    if (closeParenOffset === -1 || recordedCteOpenParens.has(openParenOffset)) {
+      continue;
+    }
+
+    recordedCteOpenParens.add(openParenOffset);
+    cteSpans.push({
+      name: firstCteName,
+      colorIndex: -1,
+      headerStartOffset: withMatch.index,
+      nameStartOffset,
+      nameEndOffset,
+      openParenOffset,
+      closeParenOffset,
+    });
+
+    let cursor = closeParenOffset + 1;
+    while (cursor < sanitized.length) {
+      const remaining = sanitized.slice(cursor);
+      const nextCteMatch = remaining.match(/^\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(/i);
+      if (!nextCteMatch || !nextCteMatch[1]) {
+        break;
+      }
+
+      const nextCteName = nextCteMatch[1];
+      if (SQL_RESERVED_KEYWORDS.has(nextCteName.toLowerCase())) {
+        break;
+      }
+
+      const nextNameRelIdx = nextCteMatch[0].search(new RegExp(`\\b${nextCteName}\\b`));
+      const nextNameStart = cursor + nextNameRelIdx;
+      const nextNameEnd = nextNameStart + nextCteName.length;
+      const nextOpenParen = cursor + nextCteMatch[0].length - 1;
+      const nextCloseParen = findMatchingCloseParen(sanitized, nextOpenParen);
+
+      if (nextCloseParen === -1) {
+        break;
+      }
+
+      if (!recordedCteOpenParens.has(nextOpenParen)) {
+        recordedCteOpenParens.add(nextOpenParen);
+        cteSpans.push({
+          name: nextCteName,
+          colorIndex: -1,
+          headerStartOffset: cursor,
+          nameStartOffset: nextNameStart,
+          nameEndOffset: nextNameEnd,
+          openParenOffset: nextOpenParen,
+          closeParenOffset: nextCloseParen,
+        });
+      }
+
+      cursor = nextCloseParen + 1;
+    }
+  }
+
+  cteSpans.sort((a, b) => a.nameStartOffset - b.nameStartOffset);
+
+  for (const cte of cteSpans) {
+    cte.colorIndex = getOrAssignCteColor(cte.name);
+
+    addMatch(cte.nameStartOffset, cte.nameEndOffset, cte.colorIndex);
+    addMatch(cte.openParenOffset, cte.openParenOffset + 1, cte.colorIndex);
+    addMatch(cte.closeParenOffset, cte.closeParenOffset + 1, cte.colorIndex);
+
+    if (keywordMode !== 'off') {
+      const betweenNameAndParen = sanitized.slice(cte.nameEndOffset, cte.openParenOffset);
+      const asRelMatch = betweenNameAndParen.match(/\bAS\b/i);
+      if (asRelMatch && asRelMatch.index !== undefined) {
+        const asStart = cte.nameEndOffset + asRelMatch.index;
+        addMatch(asStart, asStart + 2, cte.colorIndex);
+      }
+    }
+
+    cteBlocks.push({
+      name: cte.name,
+      colorIndex: cte.colorIndex,
+      nameStartOffset: cte.nameStartOffset,
+      closeParenOffset: cte.closeParenOffset,
+    });
+  }
+
+  const parseRegion = (
+    regionText: string,
+    regionStartOffset: number,
+    enclosingCteColor: number | null
+  ) => {
+    const localColorMap = new Map<string, number>();
+
+    const assignLocalEntityColor = (entityName: string): number => {
+      const lower = entityName.toLowerCase();
+
+      const existingCteColor = cteColorMap.get(lower);
+      if (existingCteColor !== undefined) {
+        return existingCteColor;
+      }
+
+      const existingLocalColor = localColorMap.get(lower);
+      if (existingLocalColor !== undefined) {
+        return existingLocalColor;
+      }
+
+      const useEnclosingCteColor =
+        enclosingCteColor !== null && innerTablesMode === 'cteColor';
+
+      const colorIdx = useEnclosingCteColor
+        ? enclosingCteColor
+        : getOrAssignIndependentColor(lower);
+
+      localColorMap.set(lower, colorIdx);
+      return colorIdx;
+    };
+
+    const fromJoinRegex =
+      /\b((?:(?:INNER|LEFT|RIGHT|FULL|CROSS|NATURAL)(?:\s+OUTER)?\s+)?JOIN|FROM)\s+([a-zA-Z_][a-zA-Z0-9_.]*)(?:(\s+AS\s+)([a-zA-Z_][a-zA-Z0-9_]*)|\s+([a-zA-Z_][a-zA-Z0-9_]*))?/gi;
+    let fjMatch: RegExpExecArray | null;
+
+    while ((fjMatch = fromJoinRegex.exec(regionText)) !== null) {
+      const clauseKeyword = fjMatch[1]!;
+      const rawTarget = fjMatch[2]!;
+      const asSegment = fjMatch[3];
+      const explicitAlias = fjMatch[4];
+      const implicitAlias = fjMatch[5];
+
+      const clauseKwAbsStart = regionStartOffset + fjMatch.index;
+      const clauseKwAbsEnd = clauseKwAbsStart + clauseKeyword.length;
+
+      const dbtRel = relations.get(rawTarget.toLowerCase());
+      const targetParts = rawTarget.split('.');
+      const baseTableName = dbtRel
+        ? dbtRel.modelOrTableName
+        : (targetParts[targetParts.length - 1] ?? rawTarget);
+
+      const prefixMatch = fjMatch[0].match(
+        /^\b(?:(?:(?:INNER|LEFT|RIGHT|FULL|CROSS|NATURAL)(?:\s+OUTER)?\s+)?JOIN|FROM)\s+/i
+      );
+      const targetRelStart = fjMatch.index + (prefixMatch ? prefixMatch[0].length : 0);
+      const targetAbsStart = regionStartOffset + targetRelStart;
+      const targetAbsEnd = targetAbsStart + rawTarget.length;
+
+      let targetColor: number | undefined;
+
+      if (dbtRel) {
+        targetColor = assignLocalEntityColor(dbtRel.modelOrTableName);
+        localColorMap.set(dbtRel.modelOrTableName.toLowerCase(), targetColor);
+      } else if (!SQL_RESERVED_KEYWORDS.has(baseTableName.toLowerCase())) {
+        targetColor = assignLocalEntityColor(baseTableName);
+        localColorMap.set(rawTarget.toLowerCase(), targetColor);
+        addMatch(targetAbsStart, targetAbsEnd, targetColor);
+      }
+
+      let validAliasColor: number | undefined;
+      let asKeywordAbsSpan: [number, number] | undefined;
+      let clauseEndRelOffset = targetRelStart + rawTarget.length;
+
+      const candidateAlias = explicitAlias || implicitAlias;
+      if (candidateAlias) {
+        const lowerAlias = candidateAlias.toLowerCase();
+
+        if (SQL_RESERVED_KEYWORDS.has(lowerAlias) || relations.has(lowerAlias)) {
+          fromJoinRegex.lastIndex = clauseEndRelOffset;
+        } else {
+          validAliasColor =
+            targetColor !== undefined
+              ? targetColor
+              : assignLocalEntityColor(candidateAlias);
+
+          localColorMap.set(lowerAlias, validAliasColor);
+
+          const aliasRelStart = fjMatch.index + fjMatch[0].lastIndexOf(candidateAlias);
+          const aliasAbsStart = regionStartOffset + aliasRelStart;
+          const aliasAbsEnd = aliasAbsStart + candidateAlias.length;
+          addMatch(aliasAbsStart, aliasAbsEnd, validAliasColor);
+
+          clauseEndRelOffset = aliasRelStart + candidateAlias.length;
+
+          if (asSegment && explicitAlias) {
+            const targetRelEnd = targetRelStart + rawTarget.length;
+            const asTrimRelIdx = regionText
+              .slice(targetRelEnd, aliasRelStart)
+              .search(/\bAS\b/i);
+            if (asTrimRelIdx !== -1) {
+              const asAbsStart = regionStartOffset + targetRelEnd + asTrimRelIdx;
+              asKeywordAbsSpan = [asAbsStart, asAbsStart + 2];
+            }
+          }
+        }
+      }
+
+      const resolvedEntityColor = validAliasColor ?? targetColor;
+      let relationalKeywordColor: number | undefined;
+
+      if (keywordMode === 'targetContext' || keywordMode === 'hybrid') {
+        relationalKeywordColor =
+          resolvedEntityColor ?? (enclosingCteColor !== null ? enclosingCteColor : undefined);
+      } else if (keywordMode === 'cteScope' && enclosingCteColor !== null) {
+        relationalKeywordColor = enclosingCteColor;
+      }
+
+      if (relationalKeywordColor !== undefined) {
+        addMatch(clauseKwAbsStart, clauseKwAbsEnd, relationalKeywordColor);
+
+        if (asKeywordAbsSpan) {
+          addMatch(asKeywordAbsSpan[0], asKeywordAbsSpan[1], relationalKeywordColor);
+        }
+
+        const afterClauseSlice = regionText.slice(clauseEndRelOffset);
+        const onUsingMatch = afterClauseSlice.match(/^\s+(ON|USING)\b/i);
+        if (onUsingMatch && onUsingMatch[1]) {
+          const kwText = onUsingMatch[1];
+          const kwRelOffset = onUsingMatch[0].length - kwText.length;
+          const kwAbsStart = regionStartOffset + clauseEndRelOffset + kwRelOffset;
+          addMatch(kwAbsStart, kwAbsStart + kwText.length, relationalKeywordColor);
+        }
+      }
+    }
+
+    if (enclosingCteColor !== null && (keywordMode === 'cteScope' || keywordMode === 'hybrid')) {
+      const structuralKeywordRegex =
+        /\b(SELECT\s+DISTINCT|SELECT|WHERE|GROUP\s+BY|ORDER\s+BY|PARTITION\s+BY|HAVING|QUALIFY|LIMIT|OFFSET|UNION\s+ALL|UNION|INTERSECT|EXCEPT|WINDOW)\b/gi;
+      let skMatch: RegExpExecArray | null;
+
+      while ((skMatch = structuralKeywordRegex.exec(regionText)) !== null) {
+        const kwStart = regionStartOffset + skMatch.index;
+        const kwEnd = kwStart + skMatch[0].length;
+        addMatch(kwStart, kwEnd, enclosingCteColor);
+      }
+    }
+
+    const columnRefRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\.(?:[a-zA-Z_][a-zA-Z0-9_]*|\*)/g;
+    let colMatch: RegExpExecArray | null;
+
+    while ((colMatch = columnRefRegex.exec(regionText)) !== null) {
+      const prefix = colMatch[1]!.toLowerCase();
+      let colorIdx = localColorMap.get(prefix);
+
+      if (colorIdx === undefined) {
+        colorIdx = cteColorMap.get(prefix);
+      }
+
+      if (colorIdx !== undefined) {
+        const startOffset = regionStartOffset + colMatch.index;
+        const endOffset = startOffset + colMatch[0].length;
+        addMatch(startOffset, endOffset, colorIdx);
+      }
+    }
+  };
+
+  const workingSqlChars = sanitized.split('');
+  const ctesByInnermostFirst = [...cteSpans].sort(
+    (a, b) => a.closeParenOffset - a.openParenOffset - (b.closeParenOffset - b.openParenOffset)
+  );
+
+  for (const cte of ctesByInnermostFirst) {
+    const bodyStart = cte.openParenOffset + 1;
+    const bodyText = workingSqlChars.slice(bodyStart, cte.closeParenOffset).join('');
+    parseRegion(bodyText, bodyStart, cte.colorIndex);
+
+    for (let i = cte.headerStartOffset; i <= cte.closeParenOffset; i++) {
+      if (workingSqlChars[i] !== '\n' && workingSqlChars[i] !== '\r') {
+        workingSqlChars[i] = ' ';
+      }
+    }
+  }
+
+  const outerSql = workingSqlChars.join('');
+  parseRegion(outerSql, 0, null);
+
+  const typeMatches = parseDataTypes(sanitized);
+
+  return { matches, cteBlocks, typeMatches };
+}

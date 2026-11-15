@@ -1,0 +1,84 @@
+{
+  "name": "dbt-prism",
+  "displayName": "dbt Prism",
+  "icon": "assets/icon.png",
+  "description": "Semantic SQL & dbt autocompletion, rich column metadata badges, and Go-to-Definition across CTEs and models.",
+  "version": "1.1.0",
+  "publisher": "elambert",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "dbt",
+    "sql",
+    "jinja",
+    "lineage",
+    "autocomplete",
+    "color",
+    "prism"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/edouard-lambert/prisms-extension-pack.git",
+    "directory": "packages/dbt-prism"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onLanguage:sql",
+    "onLanguage:jinja-sql",
+    "onLanguage:postgres",
+    "workspaceContains:**/dbt_project.yml",
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "dbt Prism",
+      "properties": {
+        "dbtPrism.goToDefinition.tableTarget": {
+          "type": "string",
+          "enum": [
+            "from_alias",
+            "source_model"
+          ],
+          "enumDescriptions": [
+            "Jump first to the table/alias declaration in the local FROM or JOIN clause, then Ctrl+Click the ref() or CTE name to open the source.",
+            "Jump directly to the source dbt model file (.sql) or CTE declaration."
+          ],
+          "default": "from_alias",
+          "description": "Controls where Ctrl+Click (Go to Definition) navigates when clicking a table qualifier in a query (e.g. 'cus' in 'SELECT cus.id')."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild ./src/extension/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "vscode:prepublish": "npm run typecheck && npm test && npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "dependencies": {
+    "@prism/core": "*",
+    "fast-glob": "^3.3.2",
+    "lru-cache": "^10.2.0",
+    "node-sql-parser": "^5.1.0",
+    "yaml": "^2.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.5.0"
+  }
+}

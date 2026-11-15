@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build:all",
+      "type": "npm",
+      "script": "build",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "build:sql-prism",
+      "type": "npm",
+      "script": "build:sql",
+      "problemMatcher": []
+    },
+    {
+      "label": "build:dbt-prism",
+      "type": "npm",
+      "script": "build:dbt",
+      "problemMatcher": []
+    }
+  ]
+}

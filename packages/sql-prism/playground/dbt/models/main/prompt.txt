@@ -1,0 +1,15 @@
+Typiquement, pour cette CTE apres dbt compile + dbt docs generate :
+
+promotions AS (
+    WITH products AS (
+        SELECT dim_products.   -- je vois que product_id (la seule colonne dans le schema.yml)
+        FROM {{ ref('dim_products') }} AS dim_products
+    )
+
+    SELECT
+        promotion.  -- je vois toutes les colonnes mais sans documentation (promotion_id est documenté dans le schema.yml)
+        products.  -- je vois que product_id sans documentation (seule colonne documenté dans le schema.yml)
+    FROM {{ ref('dim_promotion') }} AS promotion
+    LEFT JOIN products
+        ON promotion.product_id = products.product_id
+)

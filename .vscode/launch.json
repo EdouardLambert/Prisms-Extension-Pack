@@ -1,0 +1,46 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "1. Run Both (SQL Prism + dbt Prism)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/packages/sql-prism",
+        "--extensionDevelopmentPath=${workspaceFolder}/packages/dbt-prism",
+        "${workspaceFolder}/playground/jaffle_prism"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/packages/sql-prism/dist/**/*.js",
+        "${workspaceFolder}/packages/dbt-prism/dist/**/*.js"
+      ],
+      "preLaunchTask": "build:all"
+    },
+    {
+      "name": "2. Run SQL Prism Only",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/packages/sql-prism",
+        "${workspaceFolder}/playground/jaffle_prism"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/packages/sql-prism/dist/**/*.js"
+      ],
+      "preLaunchTask": "build:sql-prism"
+    },
+    {
+      "name": "3. Run dbt Prism Only",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/packages/dbt-prism",
+        "${workspaceFolder}/playground/jaffle_prism"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/packages/dbt-prism/dist/**/*.js"
+      ],
+      "preLaunchTask": "build:dbt-prism"
+    }
+  ]
+}
