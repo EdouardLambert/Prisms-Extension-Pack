@@ -2,7 +2,7 @@
   "name": "prisms-extension-pack",
   "displayName": "Prisms Extension Pack",
   "description": "Visual readability, semantic autocompletion, column metadata, and Go-to-Definition for SQL & dbt.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "elambert",
   "license": "MIT",
   "icon": "assets/icon.png",
