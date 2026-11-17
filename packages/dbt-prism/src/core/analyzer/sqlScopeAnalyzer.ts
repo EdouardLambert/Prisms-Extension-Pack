@@ -107,24 +107,30 @@ export class SqlScopeAnalyzer {
       .filter((r) => r.type === 'ref')
       .map((r) => r.modelOrTableName);
 
-    const ast = this.tryParseAst(sanitizedSql);
+    const cteLocations = locateCteDefinitions(sanitizedSql, filePath);
+    const mainQueryStartOffset = this.getMainQueryStartOffset(cteLocations);
+    const mainProjectedLocations = locateSelectProjectionColumns(
+      sanitizedSql,
+      filePath,
+      mainQueryStartOffset,
+      sanitizedSql.length
+    );
+
+    const ast = this.tryParseAst(sanitizedSql, modelName);
     if (!ast) {
-      return { columns: [], refs, materialized: effectiveMaterialized };
+      // Fallback: extract columns directly from the SELECT projection scanner when AST parsing fails
+      const fallbackColumns = this.inferColumnsWithoutAst(
+        sanitizedSql,
+        cteLocations,
+        mainProjectedLocations,
+        modelName,
+        effectiveMaterialized,
+        filePath
+      );
+      return { columns: fallbackColumns, refs, materialized: effectiveMaterialized };
     }
 
-    const cteLocations = locateCteDefinitions(sanitizedSql, filePath);
     const cteMap = this.extractLocalCtes(ast, relations, sanitizedSql, filePath, cteLocations);
-
-    const mainQueryStartOffset = this.getMainQueryStartOffset(cteLocations);
-    const mainProjectedLocations = filePath
-      ? locateSelectProjectionColumns(
-          sanitizedSql,
-          filePath,
-          mainQueryStartOffset,
-          sanitizedSql.length
-        )
-      : new Map<string, SourceLocation>();
-
     const scopedRelations = this.resolveScopedRelations(ast, cteMap, relations);
     const columns = this.extractProjectedColumns(
       ast,
@@ -136,6 +142,55 @@ export class SqlScopeAnalyzer {
     );
 
     return { columns, refs, materialized: effectiveMaterialized };
+  }
+
+  private inferColumnsWithoutAst(
+    sanitizedSql: string,
+    cteLocations: Map<string, CteLocationBlock>,
+    mainProjectedLocations: Map<string, SourceLocation>,
+    modelName: string,
+    materialized: RelationMaterialization,
+    filePath: string
+  ): ColumnMetadata[] {
+    let targetLocations = mainProjectedLocations;
+
+    // If the main query is `SELECT * FROM <last_cte>`, fall back to the projections of that CTE
+    if (targetLocations.size === 0 && cteLocations.size > 0) {
+      const mainStart = this.getMainQueryStartOffset(cteLocations);
+      const mainSql = sanitizedSql.slice(mainStart);
+      const fromCteMatch = /\bFROM\s+([a-zA-Z0-9_]+)\b/i.exec(mainSql);
+      const targetCteName = fromCteMatch?.[1]?.toLowerCase();
+      const targetCte =
+        (targetCteName ? cteLocations.get(targetCteName) : undefined) ??
+        Array.from(cteLocations.values()).pop();
+
+      if (targetCte) {
+        targetLocations = locateSelectProjectionColumns(
+          sanitizedSql,
+          filePath,
+          targetCte.bodyStartOffset,
+          targetCte.bodyEndOffset
+        );
+      }
+    }
+
+    const cols: ColumnMetadata[] = [];
+    for (const [colKey, loc] of targetLocations.entries()) {
+      const exactName =
+        sanitizedSql
+          .slice(0, sanitizedSql.length)
+          .split('\n')[loc.line]?.slice(loc.startColumn, loc.endColumn) || colKey;
+
+      cols.push({
+        name: exactName,
+        origin: 'sql_inferred',
+        sourceModelName: modelName,
+        sourceKind: materialized,
+        definitionLocation: filePath ? loc : undefined,
+      });
+    }
+
+    return cols;
   }
 
 /**
@@ -424,19 +479,19 @@ export class SqlScopeAnalyzer {
     return undefined;
   }
 
-  private tryParseAst(sql: string): any | null {
+  private tryParseAst(sql: string, debugContext = ''): any | null {
     const normalizedSql = sql
-      // Strip trailing comma right before FROM
       .replace(/,(\s*\bFROM\b)/gi, ' $1')
-      // Normalize TRY_CAST / SAFE_CAST to standard CAST
       .replace(/\b(?:TRY_CAST|SAFE_CAST)(\s*\()/gi, 'CAST$1')
-      // Normalize DuckDB GROUP BY ALL / ORDER BY ALL
       .replace(/\b(GROUP\s+BY|ORDER\s+BY)\s+ALL\b/gi, '$1 1');
 
     try {
       const parsed = this.parser.astify(normalizedSql, { database: 'PostgresQL' });
       return Array.isArray(parsed) ? parsed[0] : parsed;
-    } catch {
+    } catch (err: any) {
+      if (debugContext) {
+        console.warn(`[dbt-prism] AST parse failed in ${debugContext}: ${err?.message ?? err}`);
+      }
       return null;
     }
   }
