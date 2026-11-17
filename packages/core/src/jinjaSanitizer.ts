@@ -1,4 +1,4 @@
-// src/core/parser/jinjaSanitizer.ts
+// packages/core/src/jinjaSanitizer.ts
 
 import {
   DbtRelationToken,
@@ -21,53 +21,62 @@ export function sanitizeJinjaSql(rawSql: string): SanitizedSqlResult {
   let tokenCounter = 0;
   let materialized: RelationMaterialization | undefined;
 
-  const sanitizedSql = rawSql.replace(JINJA_BLOCK_REGEX, (match, _group, offset: number) => {
-    if (match.startsWith('{{')) {
-      // 1. Check for {{ config(... materialized='...' ...) }}
-      const configMatch = CONFIG_MATERIALIZED_REGEX.exec(match);
-      if (configMatch && configMatch[1]) {
-        materialized = normalizeMaterialization(configMatch[1]);
+  const sanitizedSql = rawSql.replace(
+    JINJA_BLOCK_REGEX,
+    (match: string, _group: string, offset: number) => {
+      if (match.startsWith('{{')) {
+        // 1. Check for {{ config(... materialized='...' ...) }}
+        const configMatch = CONFIG_MATERIALIZED_REGEX.exec(match);
+        if (configMatch && configMatch[1]) {
+          materialized = normalizeMaterialization(configMatch[1]);
+        }
+        if (/^\{\{\s*config\s*\(/i.test(match)) {
+          return maskWithWhitespace(match);
+        }
+
+        // 2. Check if it is a {{ ref(...) }} expression
+        const refMatch = REF_CALL_REGEX.exec(match);
+        if (refMatch) {
+          const modelName = refMatch[2] ?? refMatch[1] ?? '';
+          const syntheticId = buildLengthPreservingIdentifier(`_r${tokenCounter++}_`, match);
+
+          relations.set(syntheticId.toLowerCase(), {
+            syntheticId: syntheticId.toLowerCase(),
+            type: 'ref',
+            modelOrTableName: modelName,
+            startOffset: offset,
+            endOffset: offset + match.length,
+          });
+
+          return syntheticId;
+        }
+
+        // 3. Check if it is a {{ source(...) }} expression
+        const sourceMatch = SOURCE_CALL_REGEX.exec(match);
+        if (sourceMatch) {
+          const sourceName = sourceMatch[1] ?? '';
+          const tableName = sourceMatch[2] ?? '';
+          const syntheticId = buildLengthPreservingIdentifier(`_s${tokenCounter++}_`, match);
+
+          relations.set(syntheticId.toLowerCase(), {
+            syntheticId: syntheticId.toLowerCase(),
+            type: 'source',
+            sourceName,
+            modelOrTableName: tableName,
+            startOffset: offset,
+            endOffset: offset + match.length,
+          });
+
+          return syntheticId;
+        }
+
+        // 4. Any other {{ ... }} expression (var, this, macros): replace with a valid SQL identifier
+        return buildLengthPreservingIdentifier(`_j${tokenCounter++}_`, match);
       }
 
-      // 2. Check if it is a {{ ref(...) }} expression
-      const refMatch = REF_CALL_REGEX.exec(match);
-      if (refMatch) {
-        const modelName = refMatch[2] ?? refMatch[1] ?? '';
-        const syntheticId = buildLengthPreservingIdentifier(`_r${tokenCounter++}_`, match);
-
-        relations.set(syntheticId.toLowerCase(), {
-          syntheticId: syntheticId.toLowerCase(),
-          type: 'ref',
-          modelOrTableName: modelName,
-          startOffset: offset,
-          endOffset: offset + match.length,
-        });
-
-        return syntheticId;
-      }
-
-      // 3. Check if it is a {{ source(...) }} expression
-      const sourceMatch = SOURCE_CALL_REGEX.exec(match);
-      if (sourceMatch) {
-        const sourceName = sourceMatch[1] ?? '';
-        const tableName = sourceMatch[2] ?? '';
-        const syntheticId = buildLengthPreservingIdentifier(`_s${tokenCounter++}_`, match);
-
-        relations.set(syntheticId.toLowerCase(), {
-          syntheticId: syntheticId.toLowerCase(),
-          type: 'source',
-          sourceName,
-          modelOrTableName: tableName,
-          startOffset: offset,
-          endOffset: offset + match.length,
-        });
-
-        return syntheticId;
-      }
+      return maskWithWhitespace(match);
     }
-
-    return maskWithWhitespace(match);
-  });
+  );
 
   return { sanitizedSql, relations, materialized };
 }

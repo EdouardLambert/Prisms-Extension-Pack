@@ -425,8 +425,16 @@ export class SqlScopeAnalyzer {
   }
 
   private tryParseAst(sql: string): any | null {
+    const normalizedSql = sql
+      // Strip trailing comma right before FROM
+      .replace(/,(\s*\bFROM\b)/gi, ' $1')
+      // Normalize TRY_CAST / SAFE_CAST to standard CAST
+      .replace(/\b(?:TRY_CAST|SAFE_CAST)(\s*\()/gi, 'CAST$1')
+      // Normalize DuckDB GROUP BY ALL / ORDER BY ALL
+      .replace(/\b(GROUP\s+BY|ORDER\s+BY)\s+ALL\b/gi, '$1 1');
+
     try {
-      const parsed = this.parser.astify(sql, { database: 'PostgresQL' });
+      const parsed = this.parser.astify(normalizedSql, { database: 'PostgresQL' });
       return Array.isArray(parsed) ? parsed[0] : parsed;
     } catch {
       return null;

@@ -1,8 +1,11 @@
-// src/core/indexer/schemaYamlParser.ts
+// packages/dbt-prism/src/core/indexer/schemaYamlParser.ts
 
 import { parse as parseYaml } from 'yaml';
-import { ColumnMetadata, RelationMaterialization } from '@prism/core';
-import { normalizeMaterialization } from '@prism/core';
+import {
+  ColumnMetadata,
+  normalizeMaterialization,
+  RelationMaterialization,
+} from '@prism/core';
 
 export interface ParsedYamlModelSchema {
   modelName: string;
@@ -12,8 +15,8 @@ export interface ParsedYamlModelSchema {
 }
 
 /**
- * Parses a dbt schema.yml content string and extracts documented models, columns,
- * constraints, and data_tests.
+ * Parses a dbt schema.yml / sources.yml content string and extracts documented models,
+ * sources, columns, constraints, and data_tests.
  */
 export function parseDbtSchemaYaml(yamlContent: string): ParsedYamlModelSchema[] {
   let doc: any;
@@ -23,55 +26,85 @@ export function parseDbtSchemaYaml(yamlContent: string): ParsedYamlModelSchema[]
     return [];
   }
 
-  if (!doc || typeof doc !== 'object' || !Array.isArray(doc.models)) {
+  if (!doc || typeof doc !== 'object') {
     return [];
   }
 
   const results: ParsedYamlModelSchema[] = [];
 
-  for (const modelEntry of doc.models) {
-    if (!modelEntry || typeof modelEntry.name !== 'string') continue;
-
-    const modelName = modelEntry.name.trim();
-    const materialized = normalizeMaterialization(modelEntry.config?.materialized);
-    const columns = new Map<string, ColumnMetadata>();
-
-    if (Array.isArray(modelEntry.columns)) {
-      for (const colEntry of modelEntry.columns) {
-        if (!colEntry || typeof colEntry.name !== 'string') continue;
-
-        const colName = colEntry.name.trim();
-        const rawType = colEntry.data_type ?? colEntry.type;
-        const dataType = typeof rawType === 'string' ? rawType.toUpperCase() : undefined;
-        const description =
-          typeof colEntry.description === 'string' ? colEntry.description.trim() : undefined;
-
-        const constraints = extractConstraints(colEntry.constraints);
-        const rawTests = colEntry.data_tests ?? colEntry.tests;
-        const dataTests = extractDataTests(rawTests);
-
-        columns.set(colName.toLowerCase(), {
-          name: colName,
-          dataType,
-          description,
-          origin: 'schema_yml',
-          sourceModelName: modelName,
-          sourceKind: materialized,
-          constraints: constraints.length > 0 ? constraints : undefined,
-          dataTests: dataTests.length > 0 ? dataTests : undefined,
-        });
+  // 1. Parse models:
+  if (Array.isArray(doc.models)) {
+    for (const modelEntry of doc.models) {
+      const parsed = parseYamlEntityEntry(modelEntry);
+      if (parsed) {
+        results.push(parsed);
       }
     }
+  }
 
-    results.push({
-      modelName,
-      description: typeof modelEntry.description === 'string' ? modelEntry.description : undefined,
-      materialized,
-      columns,
-    });
+  // 2. Parse sources:
+  if (Array.isArray(doc.sources)) {
+    for (const sourceEntry of doc.sources) {
+      if (!sourceEntry || !Array.isArray(sourceEntry.tables)) continue;
+      for (const tableEntry of sourceEntry.tables) {
+        const parsed = parseYamlEntityEntry(tableEntry, 'source');
+        if (parsed) {
+          results.push(parsed);
+        }
+      }
+    }
   }
 
   return results;
+}
+
+function parseYamlEntityEntry(
+  entityEntry: any,
+  defaultMaterialized?: RelationMaterialization
+): ParsedYamlModelSchema | null {
+  if (!entityEntry || typeof entityEntry.name !== 'string') {
+    return null;
+  }
+
+  const modelName = entityEntry.name.trim();
+  const materialized =
+    defaultMaterialized ?? normalizeMaterialization(entityEntry.config?.materialized);
+  const columns = new Map<string, ColumnMetadata>();
+
+  if (Array.isArray(entityEntry.columns)) {
+    for (const colEntry of entityEntry.columns) {
+      if (!colEntry || typeof colEntry.name !== 'string') continue;
+
+      const colName = colEntry.name.trim();
+      const rawType = colEntry.data_type ?? colEntry.type;
+      const dataType = typeof rawType === 'string' ? rawType.toUpperCase() : undefined;
+      const description =
+        typeof colEntry.description === 'string' ? colEntry.description.trim() : undefined;
+
+      const constraints = extractConstraints(colEntry.constraints);
+      const rawTests = colEntry.data_tests ?? colEntry.tests;
+      const dataTests = extractDataTests(rawTests);
+
+      columns.set(colName.toLowerCase(), {
+        name: colName,
+        dataType,
+        description,
+        origin: 'schema_yml',
+        sourceModelName: modelName,
+        sourceKind: materialized,
+        constraints: constraints.length > 0 ? constraints : undefined,
+        dataTests: dataTests.length > 0 ? dataTests : undefined,
+      });
+    }
+  }
+
+  return {
+    modelName,
+    description:
+      typeof entityEntry.description === 'string' ? entityEntry.description : undefined,
+    materialized,
+    columns,
+  };
 }
 
 /**

@@ -116,8 +116,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const selector: vscode.DocumentSelector = [
     { language: 'sql' },
     { language: 'jinja-sql' },
+    { language: 'dbt-sql' },
     { language: 'postgres' },
-    { scheme: 'file', pattern: '**/*.sql' },
+    { language: 'snowflake-sql' },
+    { pattern: '**/*.sql' },
   ];
 
   context.subscriptions.push(
