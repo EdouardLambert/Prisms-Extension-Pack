@@ -21,7 +21,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/EdouardLambert/prisms-extension-pack.git",
+    "url": "https://github.com/EdouardLambert/prism-dev-pack.git",
     "directory": "packages/sql-prism"
   },
   "extensionKind": [

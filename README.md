@@ -1,4 +1,4 @@
-# Prisms Extension Pack
+# Prism Suite
 
 This extension pack installs the complete **Prism** suite for SQL and dbt development in VS Code:
 

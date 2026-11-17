@@ -1,6 +1,6 @@
 {
-  "name": "prisms-extension-pack",
-  "displayName": "Prisms Extension Pack",
+  "name": "prism-dev-pack",
+  "displayName": "Prism Dev Pack",
   "description": "Visual readability, semantic autocompletion, column metadata, and Go-to-Definition for SQL & dbt.",
   "version": "1.1.0",
   "publisher": "elambert",
@@ -22,7 +22,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/EdouardLambert/prisms-extension-pack.git"
+    "url": "https://github.com/EdouardLambert/prism-dev-pack.git"
   },
   "extensionPack": [
     "elambert.sql-prism",
