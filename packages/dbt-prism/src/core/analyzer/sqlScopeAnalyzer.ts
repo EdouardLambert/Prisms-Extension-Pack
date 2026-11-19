@@ -20,6 +20,8 @@ import {
   locateFromJoinAliases,
   locateSelectProjectionColumns,
   maskCommentsAndStrings,
+  scanFromJoinRelations,
+  scanSelectProjections,
 } from '@prism/core';
 
 const { Parser } = NodeSqlParser;
@@ -81,6 +83,8 @@ const SQL_HOVER_IGNORED_KEYWORDS = new Set([
   'cast',
 ]);
 
+const SYNTHETIC_JINJA_TOKEN_REGEX = /^_[rsj]\d+_*$/i;
+
 export class SqlScopeAnalyzer {
   private readonly parser = new Parser();
 
@@ -107,12 +111,20 @@ export class SqlScopeAnalyzer {
       .filter((r) => r.type === 'ref')
       .map((r) => r.modelOrTableName);
 
+    const cteLocations = locateCteDefinitions(sanitizedSql, filePath);
     const ast = this.tryParseAst(sanitizedSql);
     if (!ast) {
-      return { columns: [], refs, materialized: effectiveMaterialized };
+      const lexicalColumns = this.inferColumnsLexically(
+        sanitizedSql,
+        relations,
+        cteLocations,
+        modelName,
+        effectiveMaterialized,
+        filePath
+      );
+      return { columns: lexicalColumns, refs, materialized: effectiveMaterialized };
     }
 
-    const cteLocations = locateCteDefinitions(sanitizedSql, filePath);
     const cteMap = this.extractLocalCtes(ast, relations, sanitizedSql, filePath, cteLocations);
 
     const mainQueryStartOffset = this.getMainQueryStartOffset(cteLocations);
@@ -136,6 +148,182 @@ export class SqlScopeAnalyzer {
     );
 
     return { columns, refs, materialized: effectiveMaterialized };
+  }
+
+  private inferColumnsLexically(
+    sanitizedSql: string,
+    relations: Map<string, DbtRelationToken>,
+    cteLocations: Map<string, CteLocationBlock>,
+    modelName: string,
+    materialized: RelationMaterialization,
+    filePath: string
+  ): ColumnMetadata[] {
+    const cteColumns = new Map<string, ColumnMetadata[]>();
+
+    // 1. Resolve each CTE sequentially in declaration order
+    for (const [cteKey, cteBlock] of cteLocations.entries()) {
+      const scopedParents = this.resolveLexicalScope(
+        sanitizedSql,
+        cteBlock.bodyStartOffset,
+        cteBlock.bodyEndOffset,
+        cteColumns,
+        relations
+      );
+      const projected = this.extractLexicalProjectedColumns(
+        sanitizedSql,
+        filePath,
+        cteBlock.bodyStartOffset,
+        cteBlock.bodyEndOffset,
+        scopedParents,
+        cteBlock.cteName,
+        'cte',
+        'cte_local'
+      );
+      cteColumns.set(cteKey, projected);
+    }
+
+    // 2. Resolve the main SELECT query
+    const mainStart = this.getMainQueryStartOffset(cteLocations);
+    const mainScope = this.resolveLexicalScope(
+      sanitizedSql,
+      mainStart,
+      sanitizedSql.length,
+      cteColumns,
+      relations
+    );
+
+    return this.extractLexicalProjectedColumns(
+      sanitizedSql,
+      filePath,
+      mainStart,
+      sanitizedSql.length,
+      mainScope,
+      modelName,
+      materialized,
+      'sql_inferred'
+    );
+  }
+
+  private resolveLexicalScope(
+    sanitizedSql: string,
+    blockStartOffset: number,
+    blockEndOffset: number,
+    cteMap: Map<string, ColumnMetadata[]>,
+    relations: Map<string, DbtRelationToken>
+  ): Map<string, ScopedRelation> {
+    const scoped = new Map<string, ScopedRelation>();
+    const scannedRels = scanFromJoinRelations(
+      sanitizedSql,
+      blockStartOffset,
+      blockEndOffset,
+      relations
+    );
+
+    for (const rel of scannedRels) {
+      const lowerAlias = rel.aliasOrName.toLowerCase();
+      const lowerTarget = rel.targetName.toLowerCase();
+
+      const cteCols = cteMap.get(lowerTarget);
+      if (cteCols) {
+        scoped.set(lowerAlias, {
+          aliasOrName: rel.aliasOrName,
+          targetName: rel.targetName,
+          sourceKind: 'cte',
+          columns: cteCols,
+        });
+        continue;
+      }
+
+      const modelDesc = this.registry.getModel(rel.targetName);
+      if (modelDesc) {
+        scoped.set(lowerAlias, {
+          aliasOrName: rel.aliasOrName,
+          targetName: modelDesc.name,
+          sourceKind: modelDesc.materialized ?? (rel.isDbtSource ? 'source' : 'model'),
+          description: modelDesc.description,
+          columns: Array.from(modelDesc.columns.values()),
+        });
+      }
+    }
+
+    return scoped;
+  }
+
+  private extractLexicalProjectedColumns(
+    sanitizedSql: string,
+    filePath: string,
+    blockStartOffset: number,
+    blockEndOffset: number,
+    scopedRelations: Map<string, ScopedRelation>,
+    currentScopeName: string,
+    currentScopeKind: RelationMaterialization,
+    defaultOrigin: 'cte_local' | 'sql_inferred'
+  ): ColumnMetadata[] {
+    const items = scanSelectProjections(
+      sanitizedSql,
+      filePath,
+      blockStartOffset,
+      blockEndOffset
+    );
+    const result: ColumnMetadata[] = [];
+
+    for (const item of items) {
+      if (item.kind === 'star') {
+        const starSourceCols: ColumnMetadata[] = [];
+        if (item.qualifier) {
+          const targetRel = scopedRelations.get(item.qualifier.toLowerCase());
+          if (targetRel) starSourceCols.push(...targetRel.columns);
+        } else {
+          for (const rel of scopedRelations.values()) {
+            starSourceCols.push(...rel.columns);
+          }
+        }
+
+        for (const upstreamCol of starSourceCols) {
+          if (item.excludedColumns?.has(upstreamCol.name.toLowerCase())) {
+            continue;
+          }
+          result.push({
+            ...upstreamCol,
+            sourceModelName: currentScopeName,
+            sourceKind: currentScopeKind,
+          });
+        }
+        continue;
+      }
+
+      if (!item.name) continue;
+
+      let upstreamMeta: ColumnMetadata | undefined;
+      const lookupColName = (item.sourceColumn ?? item.name).toLowerCase();
+      if (item.qualifier) {
+        upstreamMeta = scopedRelations
+          .get(item.qualifier.toLowerCase())
+          ?.columns.find((c) => c.name.toLowerCase() === lookupColName);
+      } else {
+        for (const rel of scopedRelations.values()) {
+          const found = rel.columns.find((c) => c.name.toLowerCase() === lookupColName);
+          if (found) {
+            upstreamMeta = found;
+            break;
+          }
+        }
+      }
+
+      result.push({
+        name: item.name,
+        dataType: item.inferredType ?? upstreamMeta?.dataType,
+        description: upstreamMeta?.description,
+        origin: upstreamMeta?.origin ?? defaultOrigin,
+        sourceModelName: currentScopeName,
+        sourceKind: currentScopeKind,
+        constraints: upstreamMeta?.constraints,
+        dataTests: upstreamMeta?.dataTests,
+        definitionLocation: item.location ?? upstreamMeta?.definitionLocation,
+      });
+    }
+
+    return result;
   }
 
 /**
@@ -457,7 +645,15 @@ export class SqlScopeAnalyzer {
     if (expr.type === 'cast') {
       const target = Array.isArray(expr.target) ? expr.target[0] : expr.target;
       if (typeof target?.dataType === 'string') {
-        return target.dataType.toUpperCase();
+        const baseType = target.dataType.toUpperCase();
+        if (typeof target.length === 'number') {
+          const suffix =
+            typeof target.scale === 'number'
+              ? `(${target.length}, ${target.scale})`
+              : `(${target.length})`;
+          return `${baseType}${suffix}`;
+        }
+        return baseType;
       }
     }
 
@@ -543,7 +739,12 @@ export class SqlScopeAnalyzer {
         this.unwrapIdentifier(expr.column) ??
         (expr.type === 'cast' ? this.unwrapIdentifier(expr.expr?.column) : undefined);
 
-      if (rawColumnName === CURSOR_SYNTHETIC_TOKEN) continue;
+      if (
+        rawColumnName === CURSOR_SYNTHETIC_TOKEN ||
+        (rawColumnName && SYNTHETIC_JINJA_TOKEN_REGEX.test(rawColumnName))
+      ) {
+        continue;
+      }
 
       const tableQual = this.unwrapIdentifier(expr.table)?.toLowerCase();
 
@@ -859,6 +1060,10 @@ export class SqlScopeAnalyzer {
     const token = extractCursorTokenForDefinition(codeOnlySql, cursorOffset);
     if (!token) return null;
 
+    if (SYNTHETIC_JINJA_TOKEN_REGEX.test(token.word)) {
+      return null;
+    }
+
     const lowerWord = token.word.toLowerCase();
     if (SQL_HOVER_IGNORED_KEYWORDS.has(lowerWord)) {
       return null;
@@ -932,15 +1137,21 @@ export class SqlScopeAnalyzer {
       );
     }
 
+    // Detect if hovering directly on an explicit SELECT output alias (`... AS alias_name`)
+    const textBeforeToken = codeOnlySql.slice(0, token.startOffset);
+    const isExplicitSelectAlias = /\bAS\s+$/i.test(textBeforeToken);
+
     // 7. Hovering over an Unqualified Column matching a relation in the active scope
-    for (const rel of activeRelations.values()) {
-      const col = rel.columns.find((c) => c.name.toLowerCase() === lowerWord);
-      if (col) {
-        return {
-          candidate: this.createColumnCandidate(col, col.name, col.name, rel, 0),
-          startOffset: token.startOffset,
-          endOffset: token.endOffset,
-        };
+    if (!isExplicitSelectAlias) {
+      for (const rel of activeRelations.values()) {
+        const col = rel.columns.find((c) => c.name.toLowerCase() === lowerWord);
+        if (col) {
+          return {
+            candidate: this.createColumnCandidate(col, col.name, col.name, rel, 0),
+            startOffset: token.startOffset,
+            endOffset: token.endOffset,
+          };
+        }
       }
     }
 

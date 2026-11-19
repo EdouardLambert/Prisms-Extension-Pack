@@ -430,3 +430,310 @@ export function locateFromJoinAliases(
 
   return aliasLocations;
 }
+
+export interface ScannedProjection {
+  kind: 'column' | 'star';
+  name?: string;
+  qualifier?: string;
+  sourceColumn?: string;
+  excludedColumns?: Set<string>;
+  inferredType?: string;
+  location?: SourceLocation;
+}
+
+export interface ScannedFromRelation {
+  aliasOrName: string;
+  targetName: string;
+  isDbtSource: boolean;
+}
+
+const SYNTHETIC_JINJA_ID_REGEX = /^_[rsj]\d+_*$/i;
+
+const NON_COLUMN_TRAILING_KEYWORDS = new Set([
+  'null',
+  'true',
+  'false',
+  'end',
+  'else',
+  'then',
+  'case',
+  'and',
+  'or',
+  'not',
+  'distinct',
+  'all',
+]);
+
+const TRAILING_CAST_TYPE_REGEX =
+  /::\s*(character\s+varying|double\s+precision|timestamp\s+with(?:out)?\s+time\s+zone|time\s+with(?:out)?\s+time\s+zone|bit\s+varying|[a-zA-Z_][a-zA-Z0-9_]*)(\s*\(\s*[^()]*\s*\))?(\s*\[\s*\])*\s*$/i;
+
+const FUNC_CAST_TYPE_REGEX =
+  /^(?:TRY_CAST|SAFE_CAST|CAST)\s*\([\s\S]*\bAS\s+(character\s+varying|double\s+precision|timestamp\s+with(?:out)?\s+time\s+zone|time\s+with(?:out)?\s+time\s+zone|bit\s+varying|[a-zA-Z_][a-zA-Z0-9_]*)(\s*\(\s*[^()]*\s*\))?(\s*\[\s*\])*\s*\)\s*$/i;
+
+function inferTypeFromRawProjection(exprWithoutAlias: string): string | undefined {
+  const trimmed = exprWithoutAlias.trim();
+  if (!trimmed) return undefined;
+
+  const formatTypeMatch = (match: RegExpExecArray): string => {
+    const base = (match[1] ?? '').replace(/\s+/g, ' ').toUpperCase();
+    const params = match[2] ? match[2].replace(/\s+/g, '') : '';
+    const arraySuffix = match[3] ? '[]' : '';
+    return `${base}${params}${arraySuffix}`;
+  };
+
+  const doubleColonMatch = TRAILING_CAST_TYPE_REGEX.exec(trimmed);
+  if (doubleColonMatch) {
+    return formatTypeMatch(doubleColonMatch);
+  }
+
+  const funcCastMatch = FUNC_CAST_TYPE_REGEX.exec(trimmed);
+  if (funcCastMatch) {
+    return formatTypeMatch(funcCastMatch);
+  }
+
+  if (/^COUNT\s*\(/i.test(trimmed)) return 'BIGINT';
+  if (/^(?:SUM|AVG)\s*\(/i.test(trimmed)) return 'NUMERIC';
+
+  return undefined;
+}
+
+/**
+ * Dialect-agnostic scanner that extracts projected columns, star expansions (including DuckDB EXCLUDE),
+ * inferred cast/aggregate types, and exact source locations from a SELECT block.
+ */
+export function scanSelectProjections(
+  sanitizedSql: string,
+  filePath: string,
+  blockStartOffset: number,
+  blockEndOffset: number
+): ScannedProjection[] {
+  const cleanSql = maskCommentsAndStrings(sanitizedSql);
+  const projections: ScannedProjection[] = [];
+
+  // 1. Find the first top-level SELECT keyword inside [blockStartOffset, blockEndOffset]
+  let depth = 0;
+  let selectEndOffset = -1;
+
+  for (let i = blockStartOffset; i < blockEndOffset; i++) {
+    const ch = cleanSql[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0) {
+      const prevChar = i > blockStartOffset ? (cleanSql[i - 1] ?? ' ') : ' ';
+      if (!/[a-zA-Z0-9_]/.test(prevChar)) {
+        const selectMatch = /^SELECT(?:\s+(?:DISTINCT(?:\s+ON\s*\([^)]*\))?|ALL))?\b/i.exec(
+          cleanSql.slice(i, blockEndOffset)
+        );
+        if (selectMatch) {
+          selectEndOffset = i + selectMatch[0].length;
+          break;
+        }
+      }
+    }
+  }
+
+  if (selectEndOffset === -1) {
+    return projections;
+  }
+
+  // 2. Split projection items by top-level commas until FROM / WHERE / QUALIFY / etc.
+  const itemSpans: Array<{ start: number; end: number }> = [];
+  let itemStart = selectEndOffset;
+  depth = 0;
+
+  for (let i = selectEndOffset; i < blockEndOffset; i++) {
+    const ch = cleanSql[i];
+    if (ch === '(') {
+      depth++;
+      continue;
+    }
+    if (ch === ')') {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+
+    if (depth === 0) {
+      if (ch === ',') {
+        itemSpans.push({ start: itemStart, end: i });
+        itemStart = i + 1;
+        continue;
+      }
+
+      const prevChar = i > selectEndOffset ? (cleanSql[i - 1] ?? ' ') : ' ';
+      if (!/[a-zA-Z0-9_]/.test(prevChar)) {
+        if (STOP_CLAUSE_AT_DEPTH_ZERO_REGEX.test(cleanSql.slice(i, blockEndOffset))) {
+          itemSpans.push({ start: itemStart, end: i });
+          itemStart = -1;
+          break;
+        }
+      }
+    }
+  }
+
+  if (itemStart !== -1 && itemStart < blockEndOffset) {
+    itemSpans.push({ start: itemStart, end: blockEndOffset });
+  }
+
+  // 3. Parse each projection item
+  for (const span of itemSpans) {
+    const rawSlice = cleanSql.slice(span.start, span.end);
+    const trimmed = rawSlice.trim();
+    if (!trimmed || SYNTHETIC_JINJA_ID_REGEX.test(trimmed)) {
+      continue;
+    }
+
+    // Handle * or alias.* (with optional DuckDB EXCLUDE (col1, col2))
+    const starMatch = /^(?:([a-zA-Z0-9_]+)\s*\.\s*)?\*(?:\s+EXCLUDE\s*\(([^)]*)\))?/i.exec(trimmed);
+    if (starMatch) {
+      const excludedColumns = new Set<string>();
+      if (starMatch[2]) {
+        for (const col of starMatch[2].split(',')) {
+          const cleanCol = col.trim().replace(/^"|"$/g, '').toLowerCase();
+          if (cleanCol) excludedColumns.add(cleanCol);
+        }
+      }
+      projections.push({
+        kind: 'star',
+        qualifier: starMatch[1],
+        excludedColumns: excludedColumns.size > 0 ? excludedColumns : undefined,
+      });
+      continue;
+    }
+
+    // Check for explicit `AS <alias>` at depth 0
+    const explicitAsMatch = /\bAS\s+"?([a-zA-Z0-9_]+)"?\s*$/i.exec(rawSlice);
+    if (explicitAsMatch && explicitAsMatch[1]) {
+      const aliasName = explicitAsMatch[1];
+      if (SYNTHETIC_JINJA_ID_REGEX.test(aliasName)) continue;
+
+      const exprBeforeAs = rawSlice.slice(0, explicitAsMatch.index).trim();
+      const inferredType = inferTypeFromRawProjection(exprBeforeAs);
+      const exprWithoutCast = exprBeforeAs.replace(TRAILING_CAST_TYPE_REGEX, '').trim();
+      const directSourceMatch = /^(?:([a-zA-Z0-9_]+)\s*\.\s*)?"?([a-zA-Z0-9_]+)"?$/.exec(
+        exprWithoutCast
+      );
+
+      const aliasStartInSlice =
+        explicitAsMatch.index + explicitAsMatch[0].lastIndexOf(aliasName);
+      const absStart = span.start + aliasStartInSlice;
+      const absEnd = absStart + aliasName.length;
+
+      projections.push({
+        kind: 'column',
+        name: aliasName,
+        qualifier: directSourceMatch?.[1],
+        sourceColumn: directSourceMatch?.[2],
+        inferredType,
+        location: filePath
+          ? offsetRangeToSourceLocation(sanitizedSql, filePath, absStart, absEnd)
+          : undefined,
+      });
+      continue;
+    }
+
+    // Unaliased column (with optional qualifier and optional trailing ::TYPE cast)
+    const inferredType = inferTypeFromRawProjection(rawSlice);
+    const withoutCast = rawSlice.replace(TRAILING_CAST_TYPE_REGEX, (m) => ' '.repeat(m.length));
+    const trailingColMatch = /(?:([a-zA-Z0-9_]+)\s*\.\s*)?"?([a-zA-Z0-9_]+)"?\s*$/.exec(
+      withoutCast
+    );
+
+    if (trailingColMatch && trailingColMatch[2]) {
+      const colName = trailingColMatch[2];
+      if (
+        SYNTHETIC_JINJA_ID_REGEX.test(colName) ||
+        NON_COLUMN_TRAILING_KEYWORDS.has(colName.toLowerCase())
+      ) {
+        continue;
+      }
+
+      const colStartInSlice =
+        trailingColMatch.index + trailingColMatch[0].lastIndexOf(colName);
+      const absStart = span.start + colStartInSlice;
+      const absEnd = absStart + colName.length;
+
+      projections.push({
+        kind: 'column',
+        name: colName,
+        qualifier: trailingColMatch[1],
+        sourceColumn: colName,
+        inferredType,
+        location: filePath
+          ? offsetRangeToSourceLocation(sanitizedSql, filePath, absStart, absEnd)
+          : undefined,
+      });
+    }
+  }
+
+  return projections;
+}
+
+/**
+ * Dialect-agnostic scanner that extracts table/model/CTE relations and aliases
+ * declared in top-level FROM and JOIN clauses of a query block.
+ */
+export function scanFromJoinRelations(
+  sanitizedSql: string,
+  blockStartOffset: number,
+  blockEndOffset: number,
+  relations: Map<string, DbtRelationToken>
+): ScannedFromRelation[] {
+  const cleanSql = maskCommentsAndStrings(sanitizedSql);
+  const found: ScannedFromRelation[] = [];
+
+  let depth = 0;
+  let i = blockStartOffset;
+  const limit = Math.min(blockEndOffset, cleanSql.length);
+
+  while (i < limit) {
+    const ch = cleanSql[i];
+    if (ch === '(') {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === ')') {
+      depth = Math.max(0, depth - 1);
+      i++;
+      continue;
+    }
+
+    if (depth === 0) {
+      const prevChar = i > blockStartOffset ? (cleanSql[i - 1] ?? ' ') : ' ';
+      if (!/[a-zA-Z0-9_]/.test(prevChar)) {
+        const slice = cleanSql.slice(i, limit);
+        const clauseMatch =
+          /^(?:FROM|JOIN)\s+([a-zA-Z0-9_.]+)(?:[ \t\r\n]+(?:AS[ \t\r\n]+)?([a-zA-Z0-9_]+))?/i.exec(
+            slice
+          );
+
+        if (clauseMatch && clauseMatch[1]) {
+          const rawTableToken = clauseMatch[1];
+          const rawCandidateAlias = clauseMatch[2];
+
+          const dbtRel = relations.get(rawTableToken.toLowerCase());
+          const targetName =
+            dbtRel?.modelOrTableName ?? rawTableToken.split('.').pop() ?? rawTableToken;
+
+          const hasValidAlias =
+            Boolean(rawCandidateAlias) &&
+            !SQL_CLAUSE_RESERVED_WORDS.has(rawCandidateAlias!.toLowerCase()) &&
+            !SYNTHETIC_JINJA_ID_REGEX.test(rawCandidateAlias!);
+
+          found.push({
+            aliasOrName: hasValidAlias && rawCandidateAlias ? rawCandidateAlias : targetName,
+            targetName,
+            isDbtSource: dbtRel?.type === 'source',
+          });
+
+          i += clauseMatch[0].length;
+          continue;
+        }
+      }
+    }
+
+    i++;
+  }
+
+  return found;
+}
