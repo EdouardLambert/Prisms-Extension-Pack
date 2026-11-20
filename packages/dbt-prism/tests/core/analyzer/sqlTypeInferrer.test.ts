@@ -131,3 +131,57 @@ describe('SqlScopeAnalyzer recursive expression type inference', () => {
     expect(byName.get('casted_case')).toBe('VARCHAR(10)');
   });
 });
+
+describe('SqlScopeAnalyzer Go-to-Definition on function and CASE aliases', () => {
+  const col4Loc = { filePath: '/models/silver/table_m.sql', line: 4, startColumn: 4, endColumn: 9 };
+  const col6Loc = { filePath: '/models/silver/table_m.sql', line: 6, startColumn: 4, endColumn: 9 };
+
+  const registry = createMockRegistry([
+    {
+      name: 'table_m',
+      filePath: '/models/silver/table_m.sql',
+      materialized: 'table',
+      refs: [],
+      lastUpdated: Date.now(),
+      columns: new Map([
+        ['col_4', { name: 'col_4', dataType: 'VARCHAR', origin: 'sql_inferred', sourceModelName: 'table_m', definitionLocation: col4Loc }],
+        ['col_6', { name: 'col_6', dataType: 'VARCHAR', origin: 'sql_inferred', sourceModelName: 'table_m', definitionLocation: col6Loc }],
+      ]),
+    },
+  ]);
+
+  const analyzer = new SqlScopeAnalyzer(registry);
+
+  it('redirects when COALESCE or CASE references a single unique column', () => {
+    const sql = `
+      SELECT
+        coalesce(m.col_4, 'N/A') AS single_coalesce,
+        CASE
+          WHEN m.col_4 = 'a' THEN 'cat_1'
+          WHEN m.col_4 = 'b' THEN 'cat_2'
+          ELSE 'cat_3'
+        END AS single_case
+      FROM {{ ref('table_m') }} AS m
+    `;
+
+    expect(analyzer.computeDefinition(sql, sql.indexOf('single_coalesce') + 2)).toEqual(col4Loc);
+    expect(analyzer.computeDefinition(sql, sql.indexOf('single_case') + 2)).toEqual(col4Loc);
+  });
+
+  it('returns null when COALESCE or CASE references multiple distinct columns', () => {
+    const sql = `
+      SELECT
+        coalesce(m.col_4, m.col_6) AS multi_coalesce,
+        coalesce(m.col_4, m.col_6) AS col_4,
+        CASE
+          WHEN m.col_4 = 'a' THEN m.col_6
+          ELSE 'N/A'
+        END AS multi_case
+      FROM {{ ref('table_m') }} AS m
+    `;
+
+    expect(analyzer.computeDefinition(sql, sql.indexOf('multi_coalesce') + 2)).toBeNull();
+    expect(analyzer.computeDefinition(sql, sql.indexOf('AS col_4') + 4)).toBeNull();
+    expect(analyzer.computeDefinition(sql, sql.indexOf('multi_case') + 2)).toBeNull();
+  });
+});

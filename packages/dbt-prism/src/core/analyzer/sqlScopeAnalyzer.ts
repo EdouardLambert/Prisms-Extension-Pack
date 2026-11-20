@@ -436,15 +436,22 @@ export class SqlScopeAnalyzer {
       return null;
     }
 
+    const codeOnlySql = maskCommentsAndStrings(sanitizedSql);
+    const isExplicitSelectAlias = /\bAS\s+$/i.test(codeOnlySql.slice(0, token.startOffset));
+
     // 7. Case C: Clicking on an unqualified column or column alias inside SELECT / WHERE / ON / GROUP BY
-    for (const rel of activeRelations.values()) {
-      const foundCol = rel.columns.find((c) => c.name.toLowerCase() === lowerWord);
-      if (foundCol?.definitionLocation) {
-        return foundCol.definitionLocation;
+    if (!isExplicitSelectAlias) {
+      for (const rel of activeRelations.values()) {
+        const foundCol = rel.columns.find((c) => c.name.toLowerCase() === lowerWord);
+        if (foundCol?.definitionLocation) {
+          return foundCol.definitionLocation;
+        }
       }
     }
 
-    const aliasedSourceRef = activeSelectAst ? this.findUnderlyingColumnForSelectAlias(activeSelectAst, lowerWord) : undefined;
+    const aliasedSourceRef = activeSelectAst
+      ? this.findUnderlyingColumnForSelectAlias(activeSelectAst, lowerWord)
+      : undefined;
     if (aliasedSourceRef) {
       if (aliasedSourceRef.table) {
         const rel = activeRelations.get(aliasedSourceRef.table.toLowerCase());
@@ -460,6 +467,11 @@ export class SqlScopeAnalyzer {
           if (col?.definitionLocation) return col.definitionLocation;
         }
       }
+    }
+
+    // Stay in place when Ctrl+Clicking a multi-column or computed SELECT alias
+    if (isExplicitSelectAlias && activeSelectAst) {
+      return null;
     }
 
     // 8. Fallback: check if the identifier is a relation alias or CTE name
@@ -610,38 +622,60 @@ export class SqlScopeAnalyzer {
     for (const colItem of columns) {
       const explicitAlias = this.unwrapIdentifier(colItem?.as)?.toLowerCase();
       if (explicitAlias === lowerAliasName) {
-        return this.extractFirstColumnRefFromExpr(colItem?.expr);
+        return this.extractUniqueColumnRefFromExpr(colItem?.expr);
       }
     }
     return undefined;
   }
 
-  private extractFirstColumnRefFromExpr(
+  private extractUniqueColumnRefFromExpr(
     expr: any
   ): { table?: string; column: string } | undefined {
-    if (!expr || typeof expr !== 'object') return undefined;
+    const refs = new Map<string, { table?: string; column: string }>();
+    this.collectColumnRefsFromExpr(expr, refs);
 
-    const directCol = this.unwrapIdentifier(expr.column);
-    if (directCol && directCol !== '*' && directCol !== CURSOR_SYNTHETIC_TOKEN) {
-      return {
-        table: this.unwrapIdentifier(expr.table),
-        column: directCol,
-      };
+    if (refs.size !== 1) {
+      return undefined;
+    }
+
+    return Array.from(refs.values())[0];
+  }
+
+  private collectColumnRefsFromExpr(
+    expr: any,
+    refs: Map<string, { table?: string; column: string }>
+  ): void {
+    // Early exit as soon as more than one distinct column is referenced
+    if (!expr || typeof expr !== 'object' || refs.size > 1) return;
+
+    if (expr.type === 'column_ref') {
+      const colName = this.unwrapIdentifier(expr.column);
+      if (
+        colName &&
+        colName !== '*' &&
+        colName !== CURSOR_SYNTHETIC_TOKEN &&
+        !SYNTHETIC_JINJA_TOKEN_REGEX.test(colName)
+      ) {
+        const tableName = this.unwrapIdentifier(expr.table);
+        const key = `${(tableName ?? '').toLowerCase()}.${colName.toLowerCase()}`;
+        if (!refs.has(key)) {
+          refs.set(key, { table: tableName, column: colName });
+        }
+      }
+      return;
     }
 
     for (const value of Object.values(expr)) {
+      if (refs.size > 1) return;
       if (Array.isArray(value)) {
         for (const item of value) {
-          const found = this.extractFirstColumnRefFromExpr(item);
-          if (found) return found;
+          this.collectColumnRefsFromExpr(item, refs);
+          if (refs.size > 1) return;
         }
       } else if (value && typeof value === 'object') {
-        const found = this.extractFirstColumnRefFromExpr(value);
-        if (found) return found;
+        this.collectColumnRefsFromExpr(value, refs);
       }
     }
-
-    return undefined;
   }
 
   private tryParseAst(sql: string): any | null {
