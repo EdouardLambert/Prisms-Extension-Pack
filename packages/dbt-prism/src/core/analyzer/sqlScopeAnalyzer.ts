@@ -23,6 +23,7 @@ import {
   scanFromJoinRelations,
   scanSelectProjections,
 } from '@prism/core';
+import { inferExpressionDataType } from './sqlTypeInferrer.js';
 
 const { Parser } = NodeSqlParser;
 
@@ -738,37 +739,6 @@ export class SqlScopeAnalyzer {
     return undefined;
   }
 
-  private inferExpressionDataType(expr: any): string | undefined {
-    if (!expr) return undefined;
-
-    if (expr.type === 'cast') {
-      const target = Array.isArray(expr.target) ? expr.target[0] : expr.target;
-      if (typeof target?.dataType === 'string') {
-        const baseType = target.dataType.toUpperCase();
-        if (typeof target.length === 'number') {
-          const suffix =
-            typeof target.scale === 'number'
-              ? `(${target.length}, ${target.scale})`
-              : `(${target.length})`;
-          return `${baseType}${suffix}`;
-        }
-        return baseType;
-      }
-    }
-
-    if (expr.type === 'aggr_func' && typeof expr.name === 'string') {
-      const funcName = expr.name.toUpperCase();
-      if (funcName === 'COUNT') return 'BIGINT';
-      if (funcName === 'SUM' || funcName === 'AVG') return 'NUMERIC';
-    }
-
-    if (expr.type === 'binary_expr' && ['/', '*', '+', '-'].includes(expr.operator)) {
-      return 'NUMERIC';
-    }
-
-    return undefined;
-  }
-
   private extractLocalCtes(
     rootAst: any,
     relations: Map<string, DbtRelationToken>,
@@ -890,7 +860,7 @@ export class SqlScopeAnalyzer {
         }
       }
 
-      const inferredExprType = this.inferExpressionDataType(expr);
+      const inferredExprType = inferExpressionDataType(expr, scopedRelations);
       const explicitLoc = explicitLocations?.get(effectiveName.toLowerCase());
 
       result.push({
