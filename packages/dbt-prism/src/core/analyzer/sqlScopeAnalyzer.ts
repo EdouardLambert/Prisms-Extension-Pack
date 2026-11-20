@@ -158,9 +158,42 @@ export class SqlScopeAnalyzer {
     materialized: RelationMaterialization,
     filePath: string
   ): ColumnMetadata[] {
+    const cteColumns = this.buildLexicalCteMap(
+      sanitizedSql,
+      relations,
+      cteLocations,
+      filePath
+    );
+
+    const mainStart = this.getMainQueryStartOffset(cteLocations);
+    const mainScope = this.resolveLexicalScope(
+      sanitizedSql,
+      mainStart,
+      sanitizedSql.length,
+      cteColumns,
+      relations
+    );
+
+    return this.extractLexicalProjectedColumns(
+      sanitizedSql,
+      filePath,
+      mainStart,
+      sanitizedSql.length,
+      mainScope,
+      modelName,
+      materialized,
+      'sql_inferred'
+    );
+  }
+
+  private buildLexicalCteMap(
+    sanitizedSql: string,
+    relations: Map<string, DbtRelationToken>,
+    cteLocations: Map<string, CteLocationBlock>,
+    filePath: string
+  ): Map<string, ColumnMetadata[]> {
     const cteColumns = new Map<string, ColumnMetadata[]>();
 
-    // 1. Resolve each CTE sequentially in declaration order
     for (const [cteKey, cteBlock] of cteLocations.entries()) {
       const scopedParents = this.resolveLexicalScope(
         sanitizedSql,
@@ -182,26 +215,7 @@ export class SqlScopeAnalyzer {
       cteColumns.set(cteKey, projected);
     }
 
-    // 2. Resolve the main SELECT query
-    const mainStart = this.getMainQueryStartOffset(cteLocations);
-    const mainScope = this.resolveLexicalScope(
-      sanitizedSql,
-      mainStart,
-      sanitizedSql.length,
-      cteColumns,
-      relations
-    );
-
-    return this.extractLexicalProjectedColumns(
-      sanitizedSql,
-      filePath,
-      mainStart,
-      sanitizedSql.length,
-      mainScope,
-      modelName,
-      materialized,
-      'sql_inferred'
-    );
+    return cteColumns;
   }
 
   private resolveLexicalScope(
@@ -352,16 +366,11 @@ export class SqlScopeAnalyzer {
     const ast =
       this.tryParseAst(sanitizedSql) ??
       this.tryParseAst(healSqlAtCursor(rawSql, sanitizedSql, cursorOffset).healedSql);
-    if (!ast) return null;
 
     const cteLocations = locateCteDefinitions(sanitizedSql, currentFilePath);
-    const cteMap = this.extractLocalCtes(
-      ast,
-      relations,
-      sanitizedSql,
-      currentFilePath,
-      cteLocations
-    );
+    const cteMap = ast
+      ? this.extractLocalCtes(ast, relations, sanitizedSql, currentFilePath, cteLocations)
+      : this.buildLexicalCteMap(sanitizedSql, relations, cteLocations, currentFilePath);
 
     // 2. Check if clicking directly on a CTE name in `WITH cte_name AS (`
     const lowerWord = token.word.toLowerCase();
@@ -375,13 +384,23 @@ export class SqlScopeAnalyzer {
     }
 
     // 3. Determine the active SELECT AST block and offset range at the cursor offset
-    const activeSelectAst = this.findSelectAstAtOffset(ast, cteLocations, cursorOffset);
+    const activeSelectAst = ast
+      ? this.findSelectAstAtOffset(ast, cteLocations, cursorOffset)
+      : null;
     const activeBlockRange = this.getActiveBlockRangeAtOffset(
       sanitizedSql,
       cteLocations,
       cursorOffset
     );
-    const activeRelations = this.resolveScopedRelations(activeSelectAst, cteMap, relations);
+    const activeRelations = activeSelectAst
+      ? this.resolveScopedRelations(activeSelectAst, cteMap, relations)
+      : this.resolveLexicalScope(
+          sanitizedSql,
+          activeBlockRange.start,
+          activeBlockRange.end,
+          cteMap,
+          relations
+        );
 
     // 4. Case A1: Clicking on a table/CTE qualifier before a dot (e.g. `cus` in `SELECT cus.customer_id`)
     if (token.isQualifierBeforeDot) {
@@ -424,10 +443,7 @@ export class SqlScopeAnalyzer {
       }
     }
 
-    const aliasedSourceRef = this.findUnderlyingColumnForSelectAlias(
-      activeSelectAst,
-      lowerWord
-    );
+    const aliasedSourceRef = activeSelectAst ? this.findUnderlyingColumnForSelectAlias(activeSelectAst, lowerWord) : undefined;
     if (aliasedSourceRef) {
       if (aliasedSourceRef.table) {
         const rel = activeRelations.get(aliasedSourceRef.table.toLowerCase());
@@ -473,19 +489,34 @@ export class SqlScopeAnalyzer {
       return this.buildModelRefCompletions(healed.prefix, false);
     }
 
-    const ast = this.tryParseAst(healed.healedSql);
-    if (!ast) {
-      return [];
-    }
+    const cteLocations = locateCteDefinitions(sanitizedSql, '');
+    const ast = this.tryParseAst(healed.healedSql) ?? this.tryParseAst(sanitizedSql);
 
-    const cteMap = this.extractLocalCtes(ast, relations, healed.healedSql);
+    const cteMap = ast
+      ? this.extractLocalCtes(ast, relations, sanitizedSql, '', cteLocations)
+      : this.buildLexicalCteMap(sanitizedSql, relations, cteLocations, '');
 
     if (healed.intent === 'TABLE_OR_MODEL') {
       return this.buildTableOrModelCompletions(healed.prefix, cteMap);
     }
 
-    const activeSelectAst = this.findSelectContainingCursor(ast) ?? ast;
-    const activeRelations = this.resolveScopedRelations(activeSelectAst, cteMap, relations);
+    const activeBlockRange = this.getActiveBlockRangeAtOffset(
+      sanitizedSql,
+      cteLocations,
+      cursorOffset
+    );
+    const activeSelectAst = ast
+      ? this.findSelectAstAtOffset(ast, cteLocations, cursorOffset)
+      : null;
+    const activeRelations = activeSelectAst
+      ? this.resolveScopedRelations(activeSelectAst, cteMap, relations)
+      : this.resolveLexicalScope(
+          sanitizedSql,
+          activeBlockRange.start,
+          activeBlockRange.end,
+          cteMap,
+          relations
+        );
 
     if (healed.intent === 'DOT_COMPLETION' && healed.qualifier) {
       return this.buildDotCompletions(healed.qualifier, healed.prefix, activeRelations);
@@ -613,13 +644,22 @@ export class SqlScopeAnalyzer {
   }
 
   private tryParseAst(sql: string): any | null {
-    const normalizedSql = sql
+    const withoutQualify = this.stripQualifyClauses(sql);
+    const normalizedSql = withoutQualify
       // Strip trailing comma right before FROM
       .replace(/,(\s*\bFROM\b)/gi, ' $1')
       // Normalize TRY_CAST / SAFE_CAST to standard CAST
       .replace(/\b(?:TRY_CAST|SAFE_CAST)(\s*\()/gi, 'CAST$1')
       // Normalize DuckDB GROUP BY ALL / ORDER BY ALL
-      .replace(/\b(GROUP\s+BY|ORDER\s+BY)\s+ALL\b/gi, '$1 1');
+      .replace(/\b(GROUP\s+BY|ORDER\s+BY)\s+ALL\b/gi, '$1 1')
+      // Normalize DuckDB/MySQL niladic functions with empty parentheses
+      .replace(/\b(CURRENT_DATE|CURRENT_TIME|CURRENT_TIMESTAMP|CURRENT_USER)\s*\(\s*\)/gi, '$1')
+      // Normalize DuckDB `==` equality operator to SQL `=`
+      .replace(/([^=!<>])==(?!=)/g, '$1=')
+      // Normalize DuckDB SELECT * EXCLUDE (...) / REPLACE (...)
+      .replace(/(\*)\s+(?:EXCLUDE|REPLACE)\s*\([^)]*\)/gi, '$1')
+      // Normalize macro subqueries like `({{ max_date_update('col') }} FROM {{ this }})`
+      .replace(/\(\s*(_[rsj]\d+_*)\s+FROM\s+/gi, '(SELECT $1 FROM ');
 
     try {
       const parsed = this.parser.astify(normalizedSql, { database: 'PostgresQL' });
@@ -627,6 +667,65 @@ export class SqlScopeAnalyzer {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Strips DuckDB/Snowflake QUALIFY clauses at any query level while respecting
+   * nested parentheses (e.g. `OVER (PARTITION BY ... ORDER BY ...)`).
+   */
+  private stripQualifyClauses(sql: string): string {
+    const clean = maskCommentsAndStrings(sql);
+    const chars = sql.split('');
+    const len = clean.length;
+
+    let i = 0;
+    while (i < len) {
+      const prevChar = i > 0 ? (clean[i - 1] ?? ' ') : ' ';
+      if (!/[a-zA-Z0-9_]/.test(prevChar) && /^QUALIFY\b/i.test(clean.slice(i))) {
+        let j = i + 7;
+        let depth = 0;
+
+        while (j < len) {
+          const ch = clean[j];
+          if (ch === '(') {
+            depth++;
+            j++;
+            continue;
+          }
+          if (ch === ')') {
+            if (depth === 0) break; // End of enclosing CTE / subquery
+            depth--;
+            j++;
+            continue;
+          }
+
+          if (depth === 0) {
+            if (ch === ';') break;
+            const prev = clean[j - 1] ?? ' ';
+            if (
+              !/[a-zA-Z0-9_]/.test(prev) &&
+              /^(?:ORDER\s+BY|LIMIT|OFFSET|FETCH|UNION|EXCEPT|INTERSECT|WINDOW)\b/i.test(
+                clean.slice(j)
+              )
+            ) {
+              break;
+            }
+          }
+          j++;
+        }
+
+        for (let k = i; k < j; k++) {
+          if (chars[k] !== '\n' && chars[k] !== '\r') {
+            chars[k] = ' ';
+          }
+        }
+        i = j;
+        continue;
+      }
+      i++;
+    }
+
+    return chars.join('');
   }
 
   private unwrapIdentifier(node: any): string | undefined {
@@ -739,10 +838,7 @@ export class SqlScopeAnalyzer {
         this.unwrapIdentifier(expr.column) ??
         (expr.type === 'cast' ? this.unwrapIdentifier(expr.expr?.column) : undefined);
 
-      if (
-        rawColumnName === CURSOR_SYNTHETIC_TOKEN ||
-        (rawColumnName && SYNTHETIC_JINJA_TOKEN_REGEX.test(rawColumnName))
-      ) {
+      if (rawColumnName === CURSOR_SYNTHETIC_TOKEN) {
         continue;
       }
 
@@ -773,7 +869,7 @@ export class SqlScopeAnalyzer {
 
       const explicitAlias = this.unwrapIdentifier(colItem.as);
       const effectiveName = explicitAlias ?? rawColumnName;
-      if (!effectiveName) continue;
+      if (!effectiveName || SYNTHETIC_JINJA_TOKEN_REGEX.test(effectiveName)) continue;
 
       let upstreamMeta: ColumnMetadata | undefined;
       if (rawColumnName) {
@@ -1072,7 +1168,6 @@ export class SqlScopeAnalyzer {
     const ast =
       this.tryParseAst(sanitizedSql) ??
       this.tryParseAst(healSqlAtCursor(rawSql, sanitizedSql, cursorOffset).healedSql);
-    if (!ast) return null;
 
     const cteLocations = locateCteDefinitions(sanitizedSql, '');
 
@@ -1098,9 +1193,27 @@ export class SqlScopeAnalyzer {
       };
     }
 
-    const cteMap = this.extractLocalCtes(ast, relations, sanitizedSql, '', cteLocations);
-    const activeSelectAst = this.findSelectAstAtOffset(ast, cteLocations, cursorOffset);
-    const activeRelations = this.resolveScopedRelations(activeSelectAst, cteMap, relations);
+    const cteMap = ast
+      ? this.extractLocalCtes(ast, relations, sanitizedSql, '', cteLocations)
+      : this.buildLexicalCteMap(sanitizedSql, relations, cteLocations, '');
+
+    const activeBlockRange = this.getActiveBlockRangeAtOffset(
+      sanitizedSql,
+      cteLocations,
+      cursorOffset
+    );
+    const activeSelectAst = ast
+      ? this.findSelectAstAtOffset(ast, cteLocations, cursorOffset)
+      : null;
+    const activeRelations = activeSelectAst
+      ? this.resolveScopedRelations(activeSelectAst, cteMap, relations)
+      : this.resolveLexicalScope(
+          sanitizedSql,
+          activeBlockRange.start,
+          activeBlockRange.end,
+          cteMap,
+          relations
+        );
 
     // 4. Hovering over a table qualifier (`cus` in `cus.customer_id`) or table/alias in FROM / JOIN
     if (token.isQualifierBeforeDot || token.isAfterFromOrJoin) {
@@ -1126,6 +1239,10 @@ export class SqlScopeAnalyzer {
       };
     }
 
+    // Detect if hovering directly on an explicit SELECT output alias (`... AS alias_name`)
+    const textBeforeToken = codeOnlySql.slice(0, token.startOffset);
+    const isExplicitSelectAlias = /\bAS\s+$/i.test(textBeforeToken);
+
     // 6. Hovering over a standalone table/CTE alias in the query
     if (activeRelations.has(lowerWord)) {
       return this.resolveRelationHover(
@@ -1136,10 +1253,6 @@ export class SqlScopeAnalyzer {
         cteLocations
       );
     }
-
-    // Detect if hovering directly on an explicit SELECT output alias (`... AS alias_name`)
-    const textBeforeToken = codeOnlySql.slice(0, token.startOffset);
-    const isExplicitSelectAlias = /\bAS\s+$/i.test(textBeforeToken);
 
     // 7. Hovering over an Unqualified Column matching a relation in the active scope
     if (!isExplicitSelectAlias) {
@@ -1162,22 +1275,35 @@ export class SqlScopeAnalyzer {
       ? 'cte'
       : (materialized ?? 'model');
 
-    const projectedCols = this.extractProjectedColumns(
-      activeSelectAst,
-      activeRelations,
-      currentScopeName,
-      currentScopeKind
-    );
+    const projectedCols = activeSelectAst
+      ? this.extractProjectedColumns(
+          activeSelectAst,
+          activeRelations,
+          currentScopeName,
+          currentScopeKind
+        )
+      : this.extractLexicalProjectedColumns(
+          sanitizedSql,
+          '',
+          activeBlockRange.start,
+          activeBlockRange.end,
+          activeRelations,
+          currentScopeName,
+          currentScopeKind,
+          'sql_inferred'
+        );
     const projectedCol = projectedCols.find((c) => c.name.toLowerCase() === lowerWord);
 
     if (projectedCol) {
-      const underlyingRef = this.findUnderlyingColumnForSelectAlias(activeSelectAst, lowerWord);
+      const underlyingRef = activeSelectAst
+        ? this.findUnderlyingColumnForSelectAlias(activeSelectAst, lowerWord)
+        : undefined;
       let sourceRelation: ScopedRelation = {
         aliasOrName: currentScopeName,
         targetName: currentScopeName,
         sourceKind: currentScopeKind,
         columns: projectedCols,
-      };
+    };
 
       if (underlyingRef) {
         if (underlyingRef.table) {

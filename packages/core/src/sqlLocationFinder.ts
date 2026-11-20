@@ -726,7 +726,13 @@ export function scanFromJoinRelations(
             isDbtSource: dbtRel?.type === 'source',
           });
 
-          i += clauseMatch[0].length;
+          if (hasValidAlias && rawCandidateAlias) {
+            i += clauseMatch[0].length;
+          } else {
+            const tableEndInSlice =
+              clauseMatch[0].indexOf(rawTableToken) + rawTableToken.length;
+            i += tableEndInSlice;
+          }
           continue;
         }
       }
