@@ -1,0 +1,75 @@
+{
+  "name": "zip-prism",
+  "displayName": "ZIP Prism",
+  "icon": "assets/icon.png",
+  "description": "Inspect, search, and preview files inside ZIP archives directly in VS Code without extracting them.",
+  "version": "1.0.0",
+  "publisher": "elambert",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "keywords": [
+    "zip",
+    "archive",
+    "preview",
+    "inspector",
+    "search"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EdouardLambert/prism-dev-pack.git",
+    "directory": "packages/zip-prism"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onFileSystem:zip-prism"
+  ],
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "zipPrism.viewer",
+        "displayName": "ZIP Prism",
+        "selector": [
+          {
+            "filenamePattern": "*.zip"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "zipPrism.openArchive",
+        "title": "Open with ZIP Prism"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "zipPrism.openArchive",
+          "when": "resourceExtname == .zip",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "yauzl": "^3.1.3"
+  },
+  "devDependencies": {
+    "@types/yauzl": "^2.10.3"
+  }
+}

@@ -1,0 +1,9 @@
+.vscode/**
+src/**
+tests/**
+coverage/**
+node_modules/**
+tsconfig.json
+*.map
+*.ts
+*.vsix

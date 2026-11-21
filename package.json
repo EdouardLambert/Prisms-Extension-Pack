@@ -2,7 +2,7 @@
   "name": "prism-dev-pack",
   "displayName": "Prism Dev Pack",
   "description": "Visual readability, semantic autocompletion, column metadata, and Go-to-Definition for SQL & dbt.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "elambert",
   "license": "MIT",
   "icon": "assets/icon.png",
@@ -15,6 +15,7 @@
   "keywords": [
     "sql",
     "dbt",
+    "zip",
     "jinja",
     "cte",
     "autocomplete",
@@ -26,7 +27,8 @@
   },
   "extensionPack": [
     "elambert.sql-prism",
-    "elambert.dbt-prism"
+    "elambert.dbt-prism",
+    "elambert.zip-prism"
   ],
   "files": [
     "assets/**",
@@ -40,16 +42,15 @@
   "scripts": {
     "build:sql": "npm run build --workspace=sql-prism",
     "build:dbt": "npm run build --workspace=dbt-prism",
-    "build": "npm run build:sql && npm run build:dbt",
+    "build:zip": "npm run build --workspace=zip-prism",
+    "build": "npm run build:sql && npm run build:dbt && npm run build:zip",
     "typecheck": "tsc -p packages/sql-prism/tsconfig.json && tsc -p packages/dbt-prism/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "package:pack": "vsce package --no-dependencies",
     "package:sql": "cd packages/sql-prism && npx @vscode/vsce package --no-dependencies",
     "package:dbt": "cd packages/dbt-prism && npx @vscode/vsce package --no-dependencies",
-    "publish:pack": "vsce publish --no-dependencies",
-    "publish:sql": "cd packages/sql-prism && npx @vscode/vsce publish --no-dependencies",
-    "publish:dbt": "cd packages/dbt-prism && npx @vscode/vsce publish --no-dependencies"
+    "package:zip": "cd packages/zip-prism && npx @vscode/vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
